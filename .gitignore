@@ -1,0 +1,32 @@
+# Runtime artifacts
+.venv/
+**/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Experiment outputs
+logs/
+results/
+text_classification/logs/
+text_classification/results/
+*.pid
+
+# Large/local datasets
+text_classification/data/**/*.jsonl
+
+# Documentation excluded for this upload
+README.md
+**/README.md
+MMHARNESS.md
+
+# Local agent/plugin state
+.agents/
+.codex/
+
+# Configs that may contain local provider tokens
+text_classification/config_experiment_s3.yaml
+
+# Local probes / scratch
+text_classification/probe_read_test.txt

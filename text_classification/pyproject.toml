@@ -1,0 +1,20 @@
+[project]
+name = "text-classification"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets",
+    "litellm<1.82.7",
+    "openai-harmony",
+    "tenacity>=8",
+    "tqdm",
+]
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+include = ["text_classification*"]
+
+[tool.ruff]
+exclude = ["agents"]

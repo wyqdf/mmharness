@@ -1,0 +1,73 @@
+# Dataset split sizes — full datasets
+dataset:
+  num_train: 200
+  num_val: 50
+  num_test: 100
+  overrides:
+    # MCE tasks: use full official splits
+    USPTO:                     {num_train: 50, num_val: 30, num_test: 100}
+    Symptom2Disease:           {num_train: 200, num_val: 50, num_test: 212}
+    LawBench:                  {num_train: 200, num_val: 50, num_test: 100}
+
+# Inner loop settings
+inner_loop:
+  mode: offline      # "online" or "offline"
+  num_epochs: 1      # For offline mode: 1 epoch for local server speed (was 5)
+  temperature: 0.0   # LLM temperature (null = model default)
+  eval_interval: 0   # 0 = no intermediate evals
+  batch_size: 1
+  max_workers: 8     # Max parallel LLM calls inside each benchmark job
+  seed: 42
+
+# Models to test
+models:
+  # OpenAI-compatible proxy endpoint for GPT-family models.
+  - model: openai/gpt-oss-120b
+    api_base: https://api.pioneer.ai/v1
+    api_key_env: SOLVER_API_KEY
+  # Official/default fallback:
+  # - model: gpt-5.4-mini
+  #   api_base: https://pixel.try-chatapi.com/v1
+  #   api_key_env: OPENAI_API_KEY
+
+# mmharness endpoint settings. Secrets must come from the environment.
+mmharness:
+  proposer:
+    model: claude-opus-4-6
+    base_url_env: ANTHROPIC_BASE_URL
+    auth_token_env: ANTHROPIC_AUTH_TOKEN
+    default_base_url: https://api.pioneer.ai
+  solver:
+    api_key_env: SOLVER_API_KEY
+
+# Meta-Meta-Harness switches. Keep disabled for S1/official behavior.
+meta_meta:
+  enabled: false
+  vector_reward: false
+  show_memory: false
+  show_edges: false
+  recent_edges: 10
+  calibration: false
+  memory_llm:
+    model: claude-haiku-4-5
+    base_url_env: ANTHROPIC_BASE_URL
+    auth_token_env: ANTHROPIC_AUTH_TOKEN
+    default_base_url: https://api.pioneer.ai
+
+# Benchmark sweep settings
+benchmark:
+  seeds: [42]              # multi-seed: [42, 123, 456]
+  concurrency: 8
+
+# Datasets to test
+datasets:
+  - USPTO
+  - Symptom2Disease
+  - LawBench
+
+# Memory systems to test
+memory_systems:
+  baselines:
+    - no_memory
+    - fewshot_all
+  proposed: []  # meta_harness.py writes candidate files into agents/ at runtime

@@ -1,0 +1,48 @@
+# OOD evaluation config for METHOD.md section 5.4.
+dataset:
+  num_train: 200
+  num_val: 100
+  num_test: 100
+  overrides: {}
+inner_loop:
+  mode: offline
+  num_epochs: 1
+  temperature: 0.0
+  eval_interval: 0
+  batch_size: 1
+  max_workers: 8
+  seed: 42
+models:
+  - model: openai/gpt-oss-120b
+    api_base: https://api.pioneer.ai/v1
+    api_key_env: SOLVER_API_KEY
+benchmark:
+  seeds: [42]
+  concurrency: 8
+datasets:
+  - AGNews
+  - GoEmotions
+  - Banking77
+  - FinancialPhraseBank
+  - SciCite
+  - TweetEval_hate
+  - Amazon5
+  - SciTail
+memory_systems:
+  baselines: []
+  proposed: []
+mmharness:
+  proposer:
+    model: claude-opus-4-6
+    base_url_env: ANTHROPIC_BASE_URL
+    auth_token_env: ANTHROPIC_AUTH_TOKEN
+    default_base_url: https://api.pioneer.ai
+  solver:
+    api_key_env: SOLVER_API_KEY
+meta_meta:
+  enabled: false
+  vector_reward: false
+  show_memory: false
+  show_edges: false
+  recent_edges: 10
+  calibration: false

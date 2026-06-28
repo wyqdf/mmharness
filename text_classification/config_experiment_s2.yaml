@@ -1,0 +1,49 @@
+# METHOD.md section 5.2 full-scale S2 protocol: 60 iterations, 3 seeds.
+# Run with: python meta_harness.py --config config_experiment_s2.yaml --iterations 60
+dataset:
+  num_train: 200
+  num_val: 50
+  num_test: 100
+  overrides:
+    USPTO: {num_train: 50, num_val: 30, num_test: 100}
+    Symptom2Disease: {num_train: 200, num_val: 50, num_test: 212}
+    LawBench: {num_train: 200, num_val: 50, num_test: 100}
+inner_loop:
+  mode: offline
+  num_epochs: 1
+  temperature: 0.0
+  eval_interval: 0
+  batch_size: 1
+  max_workers: 8
+  seed: 42
+models:
+  - model: openai/gpt-oss-120b
+    api_base: https://api.pioneer.ai/v1
+    api_key_env: SOLVER_API_KEY
+benchmark:
+  seeds: [42, 123, 456]
+  concurrency: 8
+datasets:
+  - USPTO
+  - Symptom2Disease
+  - LawBench
+memory_systems:
+  baselines:
+    - no_memory
+    - fewshot_all
+  proposed: []
+mmharness:
+  proposer:
+    model: claude-opus-4-6
+    base_url_env: ANTHROPIC_BASE_URL
+    auth_token_env: ANTHROPIC_AUTH_TOKEN
+    default_base_url: https://api.pioneer.ai
+  solver:
+    api_key_env: SOLVER_API_KEY
+meta_meta:
+  enabled: true
+  vector_reward: true
+  show_memory: false
+  show_edges: true
+  recent_edges: 10
+  calibration: false

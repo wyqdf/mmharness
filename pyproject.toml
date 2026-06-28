@@ -1,0 +1,23 @@
+[project]
+name = "mmharness"
+version = "0.1.0"
+description = "Meta-Meta-Harness: K-dim vector reward + lineage graph + per-node memory + edge data, built strictly on top of the official Stanford Meta-Harness text_classification reference."
+requires-python = ">=3.11"
+dependencies = [
+    "datasets",
+    "litellm<1.82.7",
+    "openai-harmony",
+    "tenacity>=8",
+    "tqdm",
+    "pyyaml",
+    "pytest>=8",
+    # Runtime sits behind a SOCKS5 proxy; litellm/openai/httpx need this for live calls.
+    "httpx[socks]>=0.27.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["text_classification/tests"]
+pythonpath = ["."]
