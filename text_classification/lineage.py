@@ -1,8 +1,11 @@
-"""Meta-Meta-Harness lineage state.
+"""Vector reward and lineage state for S2/S3 harness evolution.
 
-This module is additive: callers only use it when ``meta_meta.enabled`` is true.
-It keeps the official scalar benchmark path intact while preserving the signals
-METHOD.md requires for S2/S3: K-dimensional rewards and explicit parent links.
+Protocol boundaries:
+- S1: scalar average reward, no explicit lineage, no edge data, no memory.
+- S2: K-dimensional ``r_vec``, explicit parent lineage, recent edge data,
+  no per-node memory, no warm-start, no calibration.
+- S3: K-dimensional ``r_vec``, explicit lineage, recent edge data,
+  per-node memory, optional warm-start, optional calibration.
 """
 
 from __future__ import annotations
@@ -62,6 +65,18 @@ def dominates(a: Sequence[float], b: Sequence[float]) -> bool:
     return all(x >= y for x, y in zip(a, b)) and any(x > y for x, y in zip(a, b))
 
 
+def pareto_frontier(nodes: list[dict]) -> list[dict]:
+    return [
+        n
+        for n in nodes
+        if not any(
+            dominates(n2["r_vec"], n["r_vec"])
+            for n2 in nodes
+            if n2["id"] != n["id"]
+        )
+    ]
+
+
 def build_r_vec_results(
     results: Mapping[tuple[str, str, str], Mapping[str, Any]],
     datasets: Sequence[str],
@@ -109,6 +124,16 @@ def pareto_frontier_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, An
         ):
             frontier.append(dict(cand))
     return sorted(frontier, key=lambda r: (-float(r.get("avg", 0.0)), int(r.get("ctx_len", 0)), str(r.get("system", ""))))
+
+
+def _frontier_node_view(node: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(node["id"]),
+        "name": str(node["name"]),
+        "r_vec": list(node.get("r_vec", [])),
+        "avg_val": float(node.get("avg_val", 0.0) or 0.0),
+        "ctx_len": int(node.get("ctx_len", 0) or 0),
+    }
 
 
 def write_frontier_vec_from_results(
@@ -194,8 +219,14 @@ class LineageGraph:
         return self._by_name.get(str(name)) if name else None
 
     def pareto_frontier(self) -> list[dict[str, Any]]:
-        latest = list(self._by_name.values())
-        return pareto_frontier_rows(latest)
+        return sorted(
+            pareto_frontier(list(self._by_name.values())),
+            key=lambda r: (
+                -float(r.get("avg_val", 0.0)),
+                int(r.get("ctx_len", 0) or 0),
+                str(r.get("name", "")),
+            ),
+        )
 
     def choose_parent(self, seed: int | None = None) -> dict[str, Any] | None:
         frontier = self.pareto_frontier()
@@ -214,6 +245,8 @@ class LineageGraph:
             edges.append(
                 {
                     "edge_id": node["id"],
+                    "parent_id": parent["id"],
+                    "child_id": node["id"],
                     "parent": parent["name"],
                     "child": node["name"],
                     "diff": unified_diff(
@@ -229,11 +262,7 @@ class LineageGraph:
         return edges[-int(limit):] if limit and limit > 0 else edges
 
     def write_frontier_vec(self) -> Path:
-        payload = {
-            "dimensions": self.dimensions,
-            "objective": "maximize each dimension of r_vec (Pareto non-dominated)",
-            "frontier": self.pareto_frontier(),
-        }
+        payload = [_frontier_node_view(node) for node in self.pareto_frontier()]
         out = self.run_dir / FRONTIER_VEC_FILENAME
         out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         return out

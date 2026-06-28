@@ -22,6 +22,8 @@ def test_s2_shows_edges_without_memory() -> None:
     assert cfg["meta_meta"]["vector_reward"] is True
     assert cfg["meta_meta"]["show_edges"] is True
     assert cfg["meta_meta"]["show_memory"] is False
+    assert cfg["meta_meta"]["calibration"] is False
+    assert cfg["meta_meta"]["recent_edges"] == 10
 
 
 def test_s3_enables_calibration() -> None:
@@ -40,6 +42,115 @@ def test_prompt_mentions_active_config_path(tmp_path) -> None:
 
     assert "Active config:" in text
     assert "config_s3.yaml" in text
+
+
+def test_s2_prompt_is_independent_from_s3_context(tmp_path) -> None:
+    cfg = yaml.safe_load((TEXT_CLASSIFICATION_DIR / "config_s2.yaml").read_text())
+    graph = LineageGraph(tmp_path, cfg["datasets"])
+    parent = graph.add_node(
+        "parent",
+        "class Parent:\n    pass\n",
+        {"USPTO": 0.2, "Symptom2Disease": 0.8, "LawBench": 0.3},
+        0.433333,
+        100,
+        0,
+    )
+    graph.add_node(
+        "child",
+        "class Parent:\n    def changed(self):\n        pass\n",
+        {"USPTO": 0.3, "Symptom2Disease": 0.7, "LawBench": 0.4},
+        0.466667,
+        120,
+        1,
+        parent_name="parent",
+    )
+
+    old_logs = meta_harness.LOGS_DIR
+    old_pending = meta_harness.PENDING_EVAL
+    old_frontier = meta_harness.FRONTIER_VAL
+    old_summary = meta_harness.EVOLUTION_SUMMARY
+    old_config = meta_harness.CONFIG_PATH
+    try:
+        meta_harness.LOGS_DIR = tmp_path
+        meta_harness.PENDING_EVAL = tmp_path / "pending_eval.json"
+        meta_harness.FRONTIER_VAL = tmp_path / "frontier_val.json"
+        meta_harness.EVOLUTION_SUMMARY = tmp_path / "evolution_summary.jsonl"
+        meta_harness.CONFIG_PATH = TEXT_CLASSIFICATION_DIR / "config_s2.yaml"
+        text = meta_harness.render_task_prompt(2, 3, cfg, graph, parent)
+    finally:
+        meta_harness.LOGS_DIR = old_logs
+        meta_harness.PENDING_EVAL = old_pending
+        meta_harness.FRONTIER_VAL = old_frontier
+        meta_harness.EVOLUTION_SUMMARY = old_summary
+        meta_harness.CONFIG_PATH = old_config
+
+    assert text.startswith("# Run S2 Vector-Lineage Harness Evolution iteration 2")
+    assert "## Selected parent" in text
+    assert "## Pareto frontier" in text
+    assert "## Recent causal edges" in text
+    assert "## Required workflow" in text
+    assert "Do not include `predicted_delta_r`." in text
+    assert "Meta-Meta evolution state" not in text
+    assert "memory.summary" not in text
+    assert "memory.refs" not in text
+    assert "evolution story" not in text
+
+
+def test_s2_pending_eval_schema_rejects_calibration_fields() -> None:
+    cfg = yaml.safe_load((TEXT_CLASSIFICATION_DIR / "config_s2.yaml").read_text())
+    valid = [
+        {
+            "name": "a",
+            "file": "agents/a.py",
+            "axis": "exploitation",
+            "base_system": "parent",
+            "hypothesis": "h",
+            "components": [],
+        },
+        {
+            "name": "b",
+            "file": "agents/b.py",
+            "axis": "exploration",
+            "base_system": "parent",
+            "hypothesis": "h",
+            "components": [],
+        },
+    ]
+    invalid = [dict(valid[0], predicted_delta_r=[0.1, 0.0, 0.0]), valid[1]]
+
+    assert meta_harness.validate_pending_eval_schema(valid, cfg)
+    assert not meta_harness.validate_pending_eval_schema(invalid, cfg)
+
+
+def test_s2_edge_trace_has_no_memory_refs_or_raw_refs(tmp_path) -> None:
+    graph = LineageGraph(tmp_path, ["A"])
+    parent = graph.add_node("p", "old\n", {"A": 0.1}, 0.1, 1, 0)
+    child = graph.add_node("c", "new\n", {"A": 0.2}, 0.2, 1, 1, parent_name="p")
+
+    old_logs = meta_harness.LOGS_DIR
+    try:
+        meta_harness.LOGS_DIR = tmp_path
+        rel = meta_harness._write_s2_edge_trace(
+            graph,
+            child["id"],
+            parent,
+            child,
+            graph.recent_edges(1)[0]["diff"],
+        )
+    finally:
+        meta_harness.LOGS_DIR = old_logs
+
+    payload = json.loads((tmp_path / rel).read_text())
+    assert set(payload) == {
+        "edge_id",
+        "parent_id",
+        "child_id",
+        "parent",
+        "child",
+        "delta_r",
+        "diff",
+        "dimensions",
+    }
 
 
 def test_calibration_row_written(tmp_path) -> None:

@@ -61,10 +61,11 @@ def format_report(payload: dict) -> str:
             )
         lines.extend(_table(header, rows))
     frontier_vec = payload.get("frontier_vec") or {}
-    if frontier_vec.get("frontier"):
+    frontier_rows = frontier_vec if isinstance(frontier_vec, list) else frontier_vec.get("frontier", [])
+    if frontier_rows:
         lines.extend(["", "## K-dimensional Pareto frontier"])
         rows = []
-        for row in frontier_vec["frontier"]:
+        for row in frontier_rows:
             rows.append(
                 [
                     row.get("system") or row.get("name"),

@@ -138,15 +138,8 @@ def run_benchmark(args):
     )
 
 
-def render_task_prompt(
-    iteration,
-    num_datasets,
-    cfg=None,
-    lineage=None,
-    parent_node=None,
-):
-    """Build the prompt for the proposer Claude session."""
-    base = (
+def render_s1_task_prompt(iteration, num_datasets, cfg=None):
+    return (
         f"Run iteration {iteration} of the evolution loop. There are {num_datasets} datasets.\n\n"
         f"## Run directories\n"
         f"All logs and results for this run are under `{LOGS_DIR}/`.\n"
@@ -156,6 +149,158 @@ def render_task_prompt(
         f"- Active config: `{CONFIG_PATH}`\n"
         f"- Write pending_eval.json to: `{PENDING_EVAL}`"
     )
+
+
+def _truncate_text(text, limit):
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n... [truncated] ..."
+
+
+def render_s2_task_prompt(iteration, num_datasets, cfg=None, lineage=None, parent_node=None):
+    frontier_nodes = lineage.pareto_frontier() if lineage else []
+    recent_edges = lineage.recent_edges(meta_meta_config(cfg or {})["recent_edges"]) if lineage else []
+    parent = parent_node or (frontier_nodes[0] if frontier_nodes else None)
+    parent_name = parent.get("name") if parent else "(none)"
+    parent_r_vec = parent.get("r_vec") if parent else []
+    parent_avg = parent.get("avg_val") if parent else 0.0
+    parent_ctx = parent.get("ctx_len") if parent else 0
+    parent_code = _truncate_text(parent.get("code", "") if parent else "", 12000)
+
+    frontier_lines = []
+    for node in frontier_nodes:
+        frontier_lines.append(
+            f"* {node.get('name')}: r_vec={node.get('r_vec')}, "
+            f"avg={node.get('avg_val')}, ctx={node.get('ctx_len')}"
+        )
+    if not frontier_lines:
+        frontier_lines.append("* (no Pareto frontier nodes available yet)")
+
+    edge_sections = []
+    for edge in recent_edges:
+        diff = _truncate_text(edge.get("diff", ""), 1800)
+        edge_sections.append(
+            "\n".join(
+                [
+                    f"### edge {edge.get('edge_id')}: {edge.get('parent')} -> {edge.get('child')}",
+                    "",
+                    f"delta_r: {edge.get('delta_r')}",
+                    "",
+                    "```diff",
+                    diff or "(no diff recorded)",
+                    "```",
+                ]
+            )
+        )
+    if not edge_sections:
+        edge_sections.append("(no recent non-root edges available yet)")
+
+    return f"""# Run S2 Vector-Lineage Harness Evolution iteration {iteration}
+
+## Objective
+
+Create exactly 2 new general-purpose memory-system candidates.
+
+Optimize the K-dimensional validation reward vector `r_vec`, not only scalar average.
+
+Do not run benchmarks. Only write `pending_eval.json`.
+
+## Inputs
+
+You are given:
+
+- selected parent code
+- selected parent `r_vec`
+- Pareto frontier `r_vec`
+- recent parent -> child edges
+- each edge's diff excerpt and `delta_r`
+
+Do not use per-node memory.
+Do not use cross-run memory.
+Do not use dataset-specific hints.
+
+## Available files
+
+- `{EVOLUTION_SUMMARY}`
+- `{FRONTIER_VAL}`
+- `{LOGS_DIR / 'frontier_vec.json'}`
+- `{LOGS_DIR / 'nodes.jsonl'}`
+- `{LOGS_DIR / 'traces' / 'edge_*.jsonl'}`
+- `{LOGS_DIR}/<dataset>/<agent>/<model>/log.jsonl`
+- Active config: `{CONFIG_PATH}`
+- Write pending_eval.json to: `{PENDING_EVAL}`
+
+## Selected parent
+
+name: {parent_name}
+r_vec: {parent_r_vec}
+avg_val: {parent_avg}
+ctx_len: {parent_ctx}
+
+Parent code:
+
+```python
+{parent_code}
+```
+
+## Pareto frontier
+
+{chr(10).join(frontier_lines)}
+
+## Recent causal edges
+
+{chr(10).join(edge_sections)}
+
+## Required workflow
+
+1. Inspect the selected parent:
+
+   * read `parent_code`
+   * read `parent_r_vec`
+   * identify weak reward dimensions
+
+2. Compare the Pareto frontier:
+
+   * identify which nodes are strong or weak on each dimension
+   * do not rank candidates only by scalar average
+
+3. Inspect recent causal edges:
+
+   * compare parent -> child diffs
+   * use `delta_r` to identify changes that improved or regressed each dimension
+
+4. Propose exactly 2 candidates:
+
+   * one exploitation candidate grounded in mechanisms supported by recent edges
+   * one exploration candidate that tries a distinct current-run-grounded mechanism
+
+5. Write `pending_eval.json` only:
+
+   * do not run benchmarks
+   * do not fabricate results
+   * do not use per-node memory or cross-run memory
+
+## Output contract
+
+Write `pending_eval.json` with exactly 2 candidates.
+
+Each candidate should include:
+
+* `name`
+* `file`
+* `axis`: either `exploitation` or `exploration`
+* `base_system`
+* `hypothesis`
+* `components`
+
+Do not include evaluation results.
+Do not include `predicted_delta_r`.
+"""
+
+
+def render_s3_task_prompt(iteration, num_datasets, cfg=None, lineage=None, parent_node=None):
+    base = render_s1_task_prompt(iteration, num_datasets, cfg)
     if not cfg or not lineage:
         return base
     mm_cfg = meta_meta_config(cfg)
@@ -170,6 +315,44 @@ def render_task_prompt(
         show_edges=mm_cfg["show_edges"],
     )
     return base + "\n\n" + block if block else base
+
+
+def render_task_prompt(
+    iteration,
+    num_datasets,
+    cfg=None,
+    lineage=None,
+    parent_node=None,
+):
+    """Dispatch to protocol-specific proposer prompts."""
+    mm_cfg = meta_meta_config(cfg or {})
+
+    if not mm_cfg.get("enabled"):
+        return render_s1_task_prompt(iteration, num_datasets, cfg)
+
+    if (
+        mm_cfg.get("vector_reward")
+        and mm_cfg.get("show_edges")
+        and not mm_cfg.get("show_memory")
+    ):
+        return render_s2_task_prompt(
+            iteration=iteration,
+            num_datasets=num_datasets,
+            cfg=cfg,
+            lineage=lineage,
+            parent_node=parent_node,
+        )
+
+    if mm_cfg.get("show_memory"):
+        return render_s3_task_prompt(
+            iteration=iteration,
+            num_datasets=num_datasets,
+            cfg=cfg,
+            lineage=lineage,
+            parent_node=parent_node,
+        )
+
+    return render_s1_task_prompt(iteration, num_datasets, cfg)
 
 
 def count_iterations_from_summary():
@@ -204,8 +387,13 @@ def _apply_proposer_env(cfg):
 
 def _proposer_skill_dir(cfg=None):
     mm_cfg = meta_meta_config(cfg or {})
-    skill_name = "meta-harness-mm" if mm_cfg["enabled"] else "meta-harness"
-    return EVOLVE_DIR / ".claude/skills" / skill_name
+    if not mm_cfg.get("enabled"):
+        skill_name = "meta-harness"
+    elif mm_cfg.get("show_memory"):
+        skill_name = "meta-harness-mm"
+    else:
+        skill_name = "meta-harness-s2"
+    return EVOLVE_DIR / ".claude" / "skills" / skill_name
 
 
 def propose_claude(task_prompt, iteration, cfg=None, timeout=2400):
@@ -265,6 +453,49 @@ def validate_candidates(candidates):
             if result.stderr:
                 print(f"      {_dim(result.stderr[:200])}")
     return valid
+
+
+def validate_pending_eval_schema(candidates, cfg):
+    if not _is_s2_config(cfg):
+        return True
+    if len(candidates) != 2:
+        print(f"  {_red('invalid S2 pending_eval')}: expected exactly 2 candidates")
+        return False
+    axes = [c.get("axis") for c in candidates]
+    if sorted(axes) != ["exploitation", "exploration"]:
+        print(
+            f"  {_red('invalid S2 pending_eval')}: expected one exploitation and one exploration"
+        )
+        return False
+    for c in candidates:
+        if "predicted_delta_r" in c:
+            print(
+                f"  {_red('invalid S2 pending_eval')}: predicted_delta_r is not allowed"
+            )
+            return False
+        forbidden = {"result", "results", "score", "accuracy", "avg_val", "delta_r"}
+        present = sorted(forbidden.intersection(c.keys()))
+        if present:
+            print(
+                f"  {_red('invalid S2 pending_eval')}: fabricated/evaluation fields {present}"
+            )
+            return False
+        required = {"name", "file", "axis", "base_system", "hypothesis", "components"}
+        missing = sorted(required.difference(c.keys()))
+        if missing:
+            print(f"  {_red('invalid S2 pending_eval')}: missing fields {missing}")
+            return False
+    return True
+
+
+def _is_s2_config(cfg):
+    mm_cfg = meta_meta_config(cfg or {})
+    return (
+        mm_cfg.get("enabled")
+        and mm_cfg.get("vector_reward")
+        and mm_cfg.get("show_edges")
+        and not mm_cfg.get("show_memory")
+    )
 
 
 def update_evolution_summary(
@@ -414,8 +645,10 @@ def run_evolve(args):
         fresh_start()
 
     lineage = LineageGraph(LOGS_DIR, dataset_order(cfg)) if vector_reward_enabled(cfg) else None
-    if lineage is not None:
+    if lineage is not None and mm_cfg["show_memory"]:
         _load_warm_graph(lineage, args.warm_from)
+    elif args.warm_from:
+        print(f"  {_yellow('warm-start skipped')}: only S3 may use --warm-from")
     memory_llm = build_memory_llm(cfg) if mm_cfg["show_memory"] else None
 
     print(
@@ -513,6 +746,8 @@ def run_evolve(args):
             continue
 
         candidates = json.loads(PENDING_EVAL.read_text()).get("candidates", [])
+        if not validate_pending_eval_schema(candidates, cfg):
+            continue
         print(
             f"  {_ts()} proposed {len(candidates)} candidate(s) in {_elapsed(propose_time)}"
         )
@@ -557,13 +792,14 @@ def run_evolve(args):
                 print(f"      {_green('OK')} ({_elapsed(elapsed)})")
                 if lineage is not None:
                     declared_parent = lineage.get(c.get("base_system")) if c.get("base_system") else None
+                    lineage_parent = parent_node if _is_s2_config(cfg) else (declared_parent or parent_node)
                     node = _record_lineage_node(
                         lineage=lineage,
                         system_name=name,
                         model_short=model_short,
                         datasets=datasets,
                         iteration=iteration,
-                        parent_node=declared_parent or parent_node,
+                        parent_node=lineage_parent,
                         cfg=cfg,
                         memory_llm=memory_llm,
                     )
@@ -768,16 +1004,25 @@ def _record_lineage_node(
     )
     if parent_node is not None and (mm_cfg["show_memory"] or mm_cfg["show_edges"]):
         diff = _unified_diff(parent_node.get("code", ""), code, str(parent_name), system_name)
-        trace_path = write_edge_trace(
-            LOGS_DIR,
-            int(node["id"]),
-            str(parent_name),
-            system_name,
-            diff,
-            node.get("delta_r"),
-            lineage.dimensions,
-            parent_memory=parent_node.get("memory"),
-        )
+        if mm_cfg["show_memory"]:
+            trace_path = write_edge_trace(
+                LOGS_DIR,
+                int(node["id"]),
+                str(parent_name),
+                system_name,
+                diff,
+                node.get("delta_r"),
+                lineage.dimensions,
+                parent_memory=parent_node.get("memory"),
+            )
+        else:
+            trace_path = _write_s2_edge_trace(
+                lineage=lineage,
+                edge_id=int(node["id"]),
+                parent_node=parent_node,
+                child_node=node,
+                diff=diff,
+            )
         memory = None
         if mm_cfg["show_memory"]:
             memory = generate_memory(
@@ -803,6 +1048,26 @@ def _record_lineage_node(
                 child_memory=memory,
             )
     return node
+
+
+def _write_s2_edge_trace(lineage, edge_id, parent_node, child_node, diff):
+    traces_dir = LOGS_DIR / "traces"
+    traces_dir.mkdir(parents=True, exist_ok=True)
+    rel_path = f"traces/edge_{edge_id}.jsonl"
+    payload = {
+        "edge_id": int(edge_id),
+        "parent_id": int(parent_node["id"]),
+        "child_id": int(child_node["id"]),
+        "parent": parent_node["name"],
+        "child": child_node["name"],
+        "delta_r": list(child_node.get("delta_r") or []),
+        "diff": diff,
+        "dimensions": list(lineage.dimensions),
+    }
+    (LOGS_DIR / rel_path).write_text(
+        json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return rel_path
 
 
 def main():

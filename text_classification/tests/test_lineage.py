@@ -5,6 +5,7 @@ import json
 from text_classification.lineage import (
     LineageGraph,
     dominates,
+    pareto_frontier,
     reward_vector,
     write_frontier_vec_from_results,
 )
@@ -18,6 +19,15 @@ def test_dominates_requires_no_worse_and_one_better() -> None:
     assert dominates([0.2, 0.5], [0.2, 0.4])
     assert not dominates([0.2, 0.4], [0.2, 0.5])
     assert not dominates([0.2, 0.5], [0.2, 0.5])
+
+
+def test_pareto_frontier_uses_node_ids() -> None:
+    nodes = [
+        {"id": 1, "r_vec": [0.2, 0.5]},
+        {"id": 2, "r_vec": [0.3, 0.4]},
+        {"id": 3, "r_vec": [0.1, 0.4]},
+    ]
+    assert {row["id"] for row in pareto_frontier(nodes)} == {1, 2}
 
 
 def test_lineage_graph_stores_code_and_parent(tmp_path) -> None:
@@ -40,7 +50,8 @@ def test_lineage_writes_k_dim_frontier(tmp_path) -> None:
 
     path = graph.write_frontier_vec()
     data = json.loads(path.read_text())
-    assert {row["name"] for row in data["frontier"]} == {"a", "b"}
+    assert {row["name"] for row in data} == {"a", "b"}
+    assert all(set(row) == {"id", "name", "r_vec", "avg_val", "ctx_len"} for row in data)
 
 
 def test_write_frontier_vec_from_results(tmp_path) -> None:
@@ -55,4 +66,3 @@ def test_write_frontier_vec_from_results(tmp_path) -> None:
 
     assert data["dimensions"] == ["A", "B"]
     assert {row["system"] for row in data["frontier"]} == {"sys1", "sys2"}
-
