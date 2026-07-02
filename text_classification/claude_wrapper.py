@@ -125,8 +125,9 @@ def build_command(
     effort=None,
 ):
     """Build the claude CLI command list."""
+    claude_bin = os.environ.get("CLAUDE_BIN", "claude")
     cmd = [
-        "claude",
+        claude_bin,
         "--dangerously-skip-permissions",
         "-p",
         prompt,

@@ -34,12 +34,14 @@ EVOLVE_DIR = Path(__file__).parent
 CONFIG_PATH = Path(os.environ.get("TEXT_CLASSIFICATION_CONFIG", EVOLVE_DIR / "config.yaml"))
 AGENTS_DIR = EVOLVE_DIR / "agents"
 BASELINE_FILES = {"__init__.py", "no_memory.py", "fewshot_memory.py", "fewshot_all.py"}
+UV_BIN = os.environ.get("UV_BIN", "uv")
 
 # These are updated per-run if --run-name is set
 LOGS_DIR = EVOLVE_DIR / "logs"
 PENDING_EVAL = LOGS_DIR / "pending_eval.json"
 FRONTIER_VAL = LOGS_DIR / "frontier_val.json"
 EVOLUTION_SUMMARY = LOGS_DIR / "evolution_summary.jsonl"
+LAST_PROPOSER_TRACE_PATH = None
 
 PROPOSER_ALLOWED_TOOLS = [
     "Read",
@@ -121,10 +123,20 @@ def run_cmd(cmd, timeout=7200, cwd=None):
         )
 
 
+def _path_relative_to_logs(path):
+    if not path:
+        return None
+    try:
+        p = Path(path)
+        return str(p.resolve().relative_to(LOGS_DIR.resolve()))
+    except (OSError, ValueError):
+        return str(path)
+
+
 def run_benchmark(args):
     return run_cmd(
         [
-            "uv",
+            UV_BIN,
             "run",
             "python",
             "benchmark.py",
@@ -138,6 +150,27 @@ def run_benchmark(args):
     )
 
 
+def _training_mode_note(cfg=None):
+    inner = dict((cfg or {}).get("inner_loop", {}) or {})
+    mode = str(inner.get("mode", "online"))
+    if mode != "offline":
+        return f"""## Training Mode
+
+This run uses `{mode}` training mode.
+"""
+    return """## Training Mode
+
+This run uses `offline` training mode.
+
+Offline semantics are important:
+- During training, examples are passed to `learn_from_batch` with ground truth visible.
+- Training `batch_results` are constructed as `prediction == ground_truth` and `was_correct == True`.
+- Therefore training-time `was_correct` is not a real solver error signal.
+- Do not build mechanisms that depend on observed training mistakes, recent incorrect examples, online error feedback, or error/correct ratios unless the memory system creates its own diagnostics without solver feedback.
+- Validation and test predictions still call the solver normally, but those eval results are not fed back into `learn_from_batch`.
+"""
+
+
 def render_s1_task_prompt(iteration, num_datasets, cfg=None):
     return (
         f"Run iteration {iteration} of the evolution loop. There are {num_datasets} datasets.\n\n"
@@ -147,7 +180,8 @@ def render_s1_task_prompt(iteration, num_datasets, cfg=None):
         f"- `{FRONTIER_VAL}` — frontier\n"
         f"- `{LOGS_DIR / 'reports'}/` — post-eval reports\n"
         f"- Active config: `{CONFIG_PATH}`\n"
-        f"- Write pending_eval.json to: `{PENDING_EVAL}`"
+        f"- Write pending_eval.json to: `{PENDING_EVAL}`\n\n"
+        f"{_training_mode_note(cfg)}"
     )
 
 
@@ -314,7 +348,25 @@ def render_s3_task_prompt(iteration, num_datasets, cfg=None, lineage=None, paren
         show_memory=mm_cfg["show_memory"],
         show_edges=mm_cfg["show_edges"],
     )
-    return base + "\n\n" + block if block else base
+    s3_contract = f"""
+## S3 Required Workflow
+
+Create exactly 2 new general-purpose memory-system candidates:
+
+- one exploitation candidate grounded in the selected parent/frontier memory
+- one exploration candidate grounded in a distinct current-run mechanism
+
+Use the K-dimensional state in dimension order `{lineage.dimensions}`:
+
+1. Read the selected parent code, `r_vec`, `memory.summary`, and `memory.refs`.
+2. Compare Pareto frontier node memories as evolution stories, not only scores.
+3. Read recent `(diff -> delta_r)` observations to infer strategy-level effects.
+4. Before writing each candidate, predict its expected `delta_r` in the same K-dimensional order.
+5. Write only `pending_eval.json`; do not run benchmarks and do not fabricate results.
+
+Each candidate must include `predicted_delta_r` as exactly {len(lineage.dimensions)} numeric values.
+"""
+    return "\n\n".join(part for part in [base, block, s3_contract] if part)
 
 
 def render_task_prompt(
@@ -398,6 +450,8 @@ def _proposer_skill_dir(cfg=None):
 
 def propose_claude(task_prompt, iteration, cfg=None, timeout=2400):
     """Returns True if candidates were produced (pending_eval.json exists)."""
+    global LAST_PROPOSER_TRACE_PATH
+    LAST_PROPOSER_TRACE_PATH = None
     old_env = os.environ.copy()
     os.environ.pop("CLAUDECODE", None)
     if cfg:
@@ -426,6 +480,7 @@ def propose_claude(task_prompt, iteration, cfg=None, timeout=2400):
             print(f"  {_dim(result.stderr[:500])}")
         return False
     result.show()
+    LAST_PROPOSER_TRACE_PATH = _path_relative_to_logs(result.log_dir)
     return PENDING_EVAL.exists()
 
 
@@ -436,7 +491,7 @@ def validate_candidates(candidates):
         name = c["name"]
         result = run_cmd(
             [
-                "uv",
+                UV_BIN,
                 "run",
                 "python",
                 "-c",
@@ -456,21 +511,26 @@ def validate_candidates(candidates):
 
 
 def validate_pending_eval_schema(candidates, cfg):
-    if not _is_s2_config(cfg):
+    if not (_is_s2_config(cfg) or _is_s3_config(cfg)):
         return True
     if len(candidates) != 2:
-        print(f"  {_red('invalid S2 pending_eval')}: expected exactly 2 candidates")
+        print(f"  {_red('invalid pending_eval')}: expected exactly 2 candidates")
         return False
     axes = [c.get("axis") for c in candidates]
     if sorted(axes) != ["exploitation", "exploration"]:
         print(
-            f"  {_red('invalid S2 pending_eval')}: expected one exploitation and one exploration"
+            f"  {_red('invalid pending_eval')}: expected one exploitation and one exploration"
         )
         return False
     for c in candidates:
-        if "predicted_delta_r" in c:
+        if _is_s2_config(cfg) and "predicted_delta_r" in c:
             print(
                 f"  {_red('invalid S2 pending_eval')}: predicted_delta_r is not allowed"
+            )
+            return False
+        if _is_s3_config(cfg) and _strict_delta_vec(c.get("predicted_delta_r"), cfg.get("datasets", [])) is None:
+            print(
+                f"  {_red('invalid S3 pending_eval')}: predicted_delta_r must be exactly K numeric values"
             )
             return False
         forbidden = {"result", "results", "score", "accuracy", "avg_val", "delta_r"}
@@ -495,6 +555,16 @@ def _is_s2_config(cfg):
         and mm_cfg.get("vector_reward")
         and mm_cfg.get("show_edges")
         and not mm_cfg.get("show_memory")
+    )
+
+
+def _is_s3_config(cfg):
+    mm_cfg = meta_meta_config(cfg or {})
+    return (
+        mm_cfg.get("enabled")
+        and mm_cfg.get("vector_reward")
+        and mm_cfg.get("show_edges")
+        and mm_cfg.get("show_memory")
     )
 
 
@@ -584,6 +654,7 @@ def _load_warm_graph(lineage, warm_from):
     source = Path(warm_from)
     if source.is_dir():
         source = source / "nodes.jsonl"
+    source_dir = source.parent
     if not source.exists():
         print(f"  {_yellow('warm-start skipped')}: {source} not found")
         return
@@ -592,10 +663,12 @@ def _load_warm_graph(lineage, warm_from):
         if not line.strip():
             continue
         node = json.loads(line)
-        if lineage.get(node.get("name")):
+        source_name = str(node["name"])
+        imported_name = f"warm::{source_name}"
+        if lineage.get(imported_name):
             continue
         lineage.add_node(
-            name=str(node["name"]),
+            name=imported_name,
             code=str(node.get("code", "")),
             per_dataset={
                 dim: float(value)
@@ -604,13 +677,32 @@ def _load_warm_graph(lineage, warm_from):
             avg_val=float(node.get("avg_val", 0.0)),
             ctx_len=int(node.get("ctx_len", 0) or 0),
             iteration=int(node.get("iter", 0) or 0),
-            parent_name=node.get("parent_name"),
-            memory=node.get("memory"),
+            parent_name=f"warm::{node.get('parent_name')}" if node.get("parent_name") else None,
+            memory=_warm_memory_with_source_refs(node.get("memory"), source_dir),
+            warm_start=True,
+            source_run=str(source_dir),
         )
         imported += 1
     if imported:
         lineage.write_frontier_vec()
         print(f"  {_green('warm-start')}: imported {imported} lineage node(s) from {source}")
+
+
+def _warm_memory_with_source_refs(memory, source_dir):
+    if not memory:
+        return memory
+    out = dict(memory)
+    refs = []
+    for ref in memory.get("refs", []) or []:
+        new_ref = dict(ref)
+        trace_path = new_ref.get("trace_path")
+        if trace_path:
+            path = Path(str(trace_path))
+            if not path.is_absolute():
+                new_ref["trace_path"] = str((Path(source_dir) / path).resolve())
+        refs.append(new_ref)
+    out["refs"] = refs
+    return out
 
 
 def run_evolve(args):
@@ -727,7 +819,10 @@ def run_evolve(args):
 
         parent_node = None
         if lineage is not None:
-            parent_node = lineage.choose_parent(seed=int(cfg["inner_loop"].get("seed", 42)) + iteration)
+            parent_node = lineage.choose_parent(
+                seed=int(cfg["inner_loop"].get("seed", 42)) + iteration,
+                include_warm_start=not mm_cfg["show_memory"],
+            )
         task_prompt = render_task_prompt(iteration, len(datasets), cfg, lineage, parent_node)
 
         if PENDING_EVAL.exists():
@@ -792,7 +887,11 @@ def run_evolve(args):
                 print(f"      {_green('OK')} ({_elapsed(elapsed)})")
                 if lineage is not None:
                     declared_parent = lineage.get(c.get("base_system")) if c.get("base_system") else None
-                    lineage_parent = parent_node if _is_s2_config(cfg) else (declared_parent or parent_node)
+                    lineage_parent = (
+                        parent_node
+                        if (_is_s2_config(cfg) or _is_s3_config(cfg))
+                        else (declared_parent or parent_node)
+                    )
                     node = _record_lineage_node(
                         lineage=lineage,
                         system_name=name,
@@ -802,6 +901,7 @@ def run_evolve(args):
                         parent_node=lineage_parent,
                         cfg=cfg,
                         memory_llm=memory_llm,
+                        proposer_trace_path=LAST_PROPOSER_TRACE_PATH,
                     )
                     if node is not None and mm_cfg["calibration"]:
                         _record_calibration(iteration, c, node, lineage.dimensions)
@@ -913,6 +1013,26 @@ def _system_result(system_name, model_short, datasets):
     return per_dataset, avg, ctx_len
 
 
+def _eval_trace_paths(system_name, model_short, datasets):
+    paths = []
+    seeds = []
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        seeds = list((cfg.get("benchmark", {}) or {}).get("seeds", [42]))
+    except OSError:
+        seeds = [42]
+    if not seeds:
+        seeds = [42]
+    for ds in datasets:
+        for seed in seeds:
+            leaf = model_short if int(seed) == 42 else f"{model_short}_seed{int(seed)}"
+            path = LOGS_DIR / ds / system_name / leaf / "log.jsonl"
+            if path.exists():
+                paths.append(_path_relative_to_logs(path))
+    return paths
+
+
 def _agent_code(system_name):
     path = AGENTS_DIR / f"{system_name}.py"
     return path.read_text(encoding="utf-8") if path.exists() else ""
@@ -936,6 +1056,18 @@ def _coerce_delta_vec(value, dims):
             out.append(0.0)
         return out
     return None
+
+
+def _strict_delta_vec(value, dims):
+    if not isinstance(value, list) or len(value) != len(dims):
+        return None
+    out = []
+    for item in value:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError):
+            return None
+    return out
 
 
 def _pearson(a, b):
@@ -979,6 +1111,7 @@ def _record_lineage_node(
     parent_node,
     cfg,
     memory_llm=None,
+    proposer_trace_path=None,
 ):
     if lineage.get(system_name):
         return lineage.get(system_name)
@@ -1004,6 +1137,7 @@ def _record_lineage_node(
     )
     if parent_node is not None and (mm_cfg["show_memory"] or mm_cfg["show_edges"]):
         diff = _unified_diff(parent_node.get("code", ""), code, str(parent_name), system_name)
+        eval_trace_paths = _eval_trace_paths(system_name, model_short, datasets)
         if mm_cfg["show_memory"]:
             trace_path = write_edge_trace(
                 LOGS_DIR,
@@ -1014,6 +1148,8 @@ def _record_lineage_node(
                 node.get("delta_r"),
                 lineage.dimensions,
                 parent_memory=parent_node.get("memory"),
+                proposer_trace_path=proposer_trace_path,
+                eval_trace_paths=eval_trace_paths,
             )
         else:
             trace_path = _write_s2_edge_trace(
@@ -1046,6 +1182,8 @@ def _record_lineage_node(
                 lineage.dimensions,
                 parent_memory=parent_node.get("memory"),
                 child_memory=memory,
+                proposer_trace_path=proposer_trace_path,
+                eval_trace_paths=eval_trace_paths,
             )
     return node
 

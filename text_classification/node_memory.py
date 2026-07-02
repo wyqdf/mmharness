@@ -133,12 +133,14 @@ def format_meta_meta_context(
         "Use this graph state to reason at the strategy level: which code changes tend to produce which multi-objective effects.",
     ]
     if parent_node:
+        parent_memory = parent_node.get("memory") or {}
         sections.extend(
             [
                 "## Selected parent node",
                 f"Name: {parent_node.get('name')}",
                 f"r_vec: {_format_vec(parent_node.get('r_vec', []), dims)}",
-                f"memory: {((parent_node.get('memory') or {}).get('summary') or '(none)')}",
+                f"memory.summary: {(parent_memory.get('summary') or '(none)')}",
+                f"memory.refs: {json.dumps(parent_memory.get('refs', []), ensure_ascii=False)}",
                 "Parent code follows; proposed candidates should build from this mechanism unless you have a strong reason not to.",
                 "```python",
                 str(parent_node.get("code", ""))[:12000],
@@ -148,8 +150,13 @@ def format_meta_meta_context(
     if show_memory and frontier_nodes:
         lines = ["## Pareto frontier node memories"]
         for node in frontier_nodes:
-            summary = ((node.get("memory") or {}).get("summary") or "(no memory)").strip()
-            lines.append(f"- {node.get('name')}: {_format_vec(node.get('r_vec', []), dims)}; {summary}")
+            memory = node.get("memory") or {}
+            summary = (memory.get("summary") or "(no memory)").strip()
+            refs = json.dumps(memory.get("refs", []), ensure_ascii=False)
+            lines.append(
+                f"- {node.get('name')}: {_format_vec(node.get('r_vec', []), dims)}; "
+                f"summary={summary}; refs={refs}"
+            )
         sections.append("\n".join(lines))
     if show_edges and recent_edges:
         lines = ["## Recent causal observations (diff -> delta_r)"]

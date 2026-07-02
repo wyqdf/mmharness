@@ -48,6 +48,7 @@ MEMORY_SYSTEMS = [(n, f"agents/{n}.py") for n in BASELINE_NAMES] + [
 ]
 SEEDS = _CONFIG["benchmark"]["seeds"]
 CONCURRENCY = _CONFIG["benchmark"]["concurrency"]
+VAL_EVAL_SAMPLES = _CONFIG["benchmark"].get("val_samples", 1)
 _DS_DEFAULTS = {k: _CONFIG["dataset"][k] for k in ("num_train", "num_val", "num_test")}
 _DS_OVERRIDES = _CONFIG["dataset"].get("overrides", {})
 
@@ -441,6 +442,8 @@ def build_val_runs(
     num_epochs: int = 1,
     temperature: float | None = None,
     max_workers: int | None = None,
+    max_tokens: int | None = None,
+    eval_samples: int = 1,
 ) -> tuple[list[tuple[str, list[str]]], int, int]:
     """Build (description, command) pairs for val runs that need to run."""
     runs = []
@@ -449,6 +452,7 @@ def build_val_runs(
         model = model_cfg["model"]
         api_base = model_cfg.get("api_base")
         api_key_env = model_cfg.get("api_key_env")
+        api_keys_env = model_cfg.get("api_keys_env")
         model_name = get_model_short_name(model)
         for dataset in datasets:
             n_train, n_val, n_test = get_dataset_sizes(dataset)
@@ -498,12 +502,18 @@ def build_val_runs(
                         cmd.extend(["--api-base", api_base])
                     if api_key_env:
                         cmd.extend(["--api-key-env", api_key_env])
+                    if api_keys_env:
+                        cmd.extend(["--api-keys-env", api_keys_env])
                     if mode == "offline" and num_epochs > 1:
                         cmd.extend(["--num-epochs", str(num_epochs)])
                     if temperature is not None:
                         cmd.extend(["--temperature", str(temperature)])
                     if max_workers is not None:
                         cmd.extend(["--max-workers", str(max_workers)])
+                    if max_tokens is not None:
+                        cmd.extend(["--max-tokens", str(max_tokens)])
+                    if eval_samples and eval_samples > 1:
+                        cmd.extend(["--eval-samples", str(eval_samples)])
                     runs.append((desc, cmd))
     random.shuffle(runs)
     return runs, len(runs), num_done
@@ -519,6 +529,7 @@ def build_test_runs(
     num_epochs: int = 1,
     temperature: float | None = None,
     max_workers: int | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[list[tuple[str, list[str]]], int, int]:
     """Build (description, command) pairs for test runs that need to run."""
     runs = []
@@ -527,6 +538,7 @@ def build_test_runs(
         model = model_cfg["model"]
         api_base = model_cfg.get("api_base")
         api_key_env = model_cfg.get("api_key_env")
+        api_keys_env = model_cfg.get("api_keys_env")
         model_name = get_model_short_name(model)
         for dataset in datasets:
             n_train, n_val, n_test = get_dataset_sizes(dataset)
@@ -585,10 +597,14 @@ def build_test_runs(
                         cmd.extend(["--api-base", api_base])
                     if api_key_env:
                         cmd.extend(["--api-key-env", api_key_env])
+                    if api_keys_env:
+                        cmd.extend(["--api-keys-env", api_keys_env])
                     if temperature is not None:
                         cmd.extend(["--temperature", str(temperature)])
                     if max_workers is not None:
                         cmd.extend(["--max-workers", str(max_workers)])
+                    if max_tokens is not None:
+                        cmd.extend(["--max-tokens", str(max_tokens)])
                     runs.append((desc, cmd))
     random.shuffle(runs)
     return runs, len(runs), num_done
@@ -799,7 +815,7 @@ def print_missing(
 
 
 async def main():
-    global _CONFIG, DATASETS, MODELS, BASELINE_NAMES, PROPOSED_NAMES, MEMORY_SYSTEMS, SEEDS, CONCURRENCY, _DS_DEFAULTS, _DS_OVERRIDES
+    global _CONFIG, DATASETS, MODELS, BASELINE_NAMES, PROPOSED_NAMES, MEMORY_SYSTEMS, SEEDS, CONCURRENCY, VAL_EVAL_SAMPLES, _DS_DEFAULTS, _DS_OVERRIDES
     parser = argparse.ArgumentParser(description="Sweep datasets x memory systems")
     parser.add_argument("--config", type=str, default=None, help="Config YAML path")
     parser.add_argument("--memory", type=str, help="Filter to one memory system")
@@ -841,6 +857,12 @@ async def main():
         help="Maximum parallel LLM calls inside each benchmark job",
     )
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=_CONFIG["inner_loop"].get("max_tokens", 16384),
+        help="Maximum completion tokens for each LLM call",
+    )
+    parser.add_argument(
         "--logs-dir",
         type=str,
         default=None,
@@ -861,6 +883,7 @@ async def main():
         ]
         SEEDS = _CONFIG["benchmark"]["seeds"]
         CONCURRENCY = _CONFIG["benchmark"]["concurrency"]
+        VAL_EVAL_SAMPLES = _CONFIG["benchmark"].get("val_samples", 1)
         _DS_DEFAULTS = {k: _CONFIG["dataset"][k] for k in ("num_train", "num_val", "num_test")}
         _DS_OVERRIDES = _CONFIG["dataset"].get("overrides", {})
 
@@ -935,6 +958,7 @@ async def main():
             args.num_epochs,
             args.temperature,
             args.max_workers,
+            args.max_tokens,
         )
     else:
         runs, num_pending, num_done = build_val_runs(
@@ -946,6 +970,8 @@ async def main():
             args.num_epochs,
             args.temperature,
             args.max_workers,
+            args.max_tokens,
+            VAL_EVAL_SAMPLES,
         )
     n_total = num_pending + num_done
 
@@ -956,7 +982,8 @@ async def main():
     print(f"Status: {num_done}/{n_total} done, {num_pending} pending [{metric}]")
     print(f"  Models: {', '.join(model_names)}")
     print(f"  Datasets: {len(datasets)}, Memory: {len(memory_systems)}, Seeds: {SEEDS}")
-    print(f"  {mode_str} workers={args.max_workers}")
+    sample_str = f" val_samples={VAL_EVAL_SAMPLES}" if metric == "val" else ""
+    print(f"  {mode_str} workers={args.max_workers}{sample_str}")
 
     if args.test:
         print_results(load_results(results_dir, "test.json"), metric_label="test")

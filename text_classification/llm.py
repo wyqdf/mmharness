@@ -36,6 +36,7 @@ CACHE_DIR = Path(
     )
 )
 CACHE_VERSION = 1
+CACHE_DISABLED_ENV = "TEXT_CLASSIFICATION_DISABLE_LLM_CACHE"
 KNOWN_PROVIDER_PREFIXES = (
     "anthropic/",
     "azure/",
@@ -279,12 +280,15 @@ class ProviderLLM:
         self, prompt: str, system_prompt: str | None, kwargs: dict[str, Any]
     ) -> str:
         cache_path = self._cache_path(prompt, system_prompt, kwargs)
-        cached = self._load_cache(cache_path)
-        if cached is not None:
-            return cached["content"]
+        cache_disabled = os.environ.get(CACHE_DISABLED_ENV) == "1"
+        if not cache_disabled:
+            cached = self._load_cache(cache_path)
+            if cached is not None:
+                return cached["content"]
 
         result = self._call_completion(prompt, system_prompt, kwargs)
-        self._save_cache(cache_path, result)
+        if not cache_disabled:
+            self._save_cache(cache_path, result)
 
         with self._usage_lock:
             self.total_input_tokens += result["input_tokens"]

@@ -190,6 +190,8 @@ class LineageGraph:
         iteration: int,
         parent_name: str | None = None,
         memory: Mapping[str, Any] | None = None,
+        warm_start: bool = False,
+        source_run: str | None = None,
     ) -> dict[str, Any]:
         parent = self._by_name.get(parent_name or "")
         r_vec = reward_vector(per_dataset, self.dimensions)
@@ -206,6 +208,10 @@ class LineageGraph:
             "iter": int(iteration),
             "memory": dict(memory) if memory is not None else None,
         }
+        if warm_start:
+            node["warm_start"] = True
+            if source_run:
+                node["source_run"] = str(source_run)
         self._next_id += 1
         self._nodes.append(node)
         self._by_name[name] = node
@@ -228,8 +234,23 @@ class LineageGraph:
             ),
         )
 
-    def choose_parent(self, seed: int | None = None) -> dict[str, Any] | None:
-        frontier = self.pareto_frontier()
+    def choose_parent(
+        self,
+        seed: int | None = None,
+        include_warm_start: bool = True,
+    ) -> dict[str, Any] | None:
+        if not include_warm_start:
+            candidates = [node for node in self._by_name.values() if not node.get("warm_start")]
+            frontier = sorted(
+                pareto_frontier(candidates),
+                key=lambda r: (
+                    -float(r.get("avg_val", 0.0)),
+                    int(r.get("ctx_len", 0) or 0),
+                    str(r.get("name", "")),
+                ),
+            )
+        else:
+            frontier = self.pareto_frontier()
         if not frontier:
             return None
         return random.Random(seed).choice(frontier)

@@ -116,26 +116,19 @@ def _run_offline_loop(
     logger: JSONLLogger | None = None,
     step_offset: int = 0,
     collect_trajectory: bool = True,
-    val_examples: list[dict[str, Any]] | None = None,
     skip_train_eval: bool = False,
 ) -> dict[str, Any]:
     """Run offline training: train with ground truth visible, then evaluate.
 
     In offline mode:
     1. Train phase: batch examples → learn_from_batch, multiple epochs
-    2. If val_examples provided: eval on val after each epoch, keep best checkpoint
-    3. Eval phase: predict on all examples to measure final accuracy (no updates)
+    2. Eval phase: predict on all examples to measure final accuracy (no updates)
        (skipped when skip_train_eval=True, e.g. val-only evolve runs)
 
     Returns accuracy measured AFTER training (not during).
     """
     trajectory = [] if collect_trajectory else None
     total_steps = num_epochs * len(examples)
-
-    # Early stopping state
-    best_val_acc = -1.0
-    best_state = None
-    best_epoch = 0
 
     # Training phase: batch-based learning with ground truth visible
     step = 0
@@ -174,41 +167,6 @@ def _run_offline_loop(
                 logger.checkpoint(global_idx, memory.get_state())
 
             step += len(batch)
-
-        # Val eval after each epoch for early stopping
-        if val_examples:
-            val_result = evaluate_memory(
-                memory, val_examples, check_answer, max_workers
-            )
-            val_acc = val_result["accuracy"]
-            if logger:
-                logger.log(
-                    "val_epoch",
-                    epoch=epoch,
-                    val_acc=round(val_acc, 4),
-                    val_correct=val_result["correct"],
-                    val_total=val_result["total"],
-                )
-            print(
-                f"  epoch {epoch}: val={val_acc:.1%} ({val_result['correct']}/{val_result['total']})",
-                flush=True,
-            )
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_state = memory.get_state()
-                best_epoch = epoch
-
-    # Restore best checkpoint if we did early stopping
-    if best_state is not None and best_epoch < num_epochs - 1:
-        print(
-            f"  early stopping: restoring epoch {best_epoch} (val={best_val_acc:.1%})",
-            flush=True,
-        )
-        memory.set_state(best_state)
-        if logger:
-            logger.log(
-                "early_stop", best_epoch=best_epoch, best_val_acc=round(best_val_acc, 4)
-            )
 
     # Evaluation phase: predict on all examples (no updates)
     # Skip when skip_train_eval=True (val-only mode — saves ~15 min per system)
@@ -285,7 +243,6 @@ def run_inner_loop(
     collect_trajectory: bool = True,
     mode: str = "online",
     num_epochs: int = 1,
-    val_examples: list[dict[str, Any]] | None = None,
     skip_train_eval: bool = False,
 ) -> dict[str, Any]:
     """Run training with memory system.
@@ -303,7 +260,6 @@ def run_inner_loop(
             - online: predict first, then update with feedback (single pass)
             - offline: train with ground truth visible, can run multiple epochs
         num_epochs: Number of epochs for offline mode (ignored in online mode)
-        val_examples: Validation examples for early stopping in offline mode
         skip_train_eval: Skip final train eval in offline mode (val-only evolve runs)
     """
     if mode == "offline":
@@ -317,7 +273,6 @@ def run_inner_loop(
             logger=logger,
             step_offset=step_offset,
             collect_trajectory=collect_trajectory,
-            val_examples=val_examples,
             skip_train_eval=skip_train_eval,
         )
     # Online mode (default): predict batch → learn from batch
@@ -426,6 +381,7 @@ def evaluate_memory(
     examples: list[dict[str, Any]],
     check_answer: Callable[..., bool],
     max_workers: int = 32,
+    eval_samples: int = 1,
 ) -> dict[str, Any]:
     """Evaluate without updating (parallel)."""
     if not examples:
@@ -436,42 +392,55 @@ def evaluate_memory(
             "predictions": [],
             "avg_prompt_len": 0,
         }
+    eval_samples = max(1, int(eval_samples or 1))
 
     def predict_one(idx: int, ex: dict[str, Any]) -> tuple:
-        pred, _ = memory.predict(ex["input"])
-        prompt_info = memory.get_last_prompt_info()
-        prompt_len = prompt_info.get("prompt_len") or 0
-        prompt_text = prompt_info.get("prompt_text") or ""
-        # Injected context = full prompt - test input (remainder is template + memory context)
-        context_len = max(0, prompt_len - len(ex["input"])) if prompt_len else 0
-        raw = check_answer(pred, ex["target"], **_get_eval_kwargs(ex))
-        ok, metrics = _unpack_eval_result(raw)
-        result = {
-            "prediction": pred,
-            "target": ex["target"],
-            "was_correct": ok,
-            "prompt_len": prompt_len,
-            "context_len": context_len,
-            "prompt_text": prompt_text,
-        }
-        if metrics:
-            result["metrics"] = metrics
-        return idx, result
+        results = []
+        for sample_idx in range(eval_samples):
+            pred, _ = memory.predict(ex["input"])
+            prompt_info = memory.get_last_prompt_info()
+            prompt_len = prompt_info.get("prompt_len") or 0
+            prompt_text = prompt_info.get("prompt_text") or ""
+            # Injected context = full prompt - test input (remainder is template + memory context)
+            context_len = max(0, prompt_len - len(ex["input"])) if prompt_len else 0
+            raw = check_answer(pred, ex["target"], **_get_eval_kwargs(ex))
+            ok, metrics = _unpack_eval_result(raw)
+            result = {
+                "prediction": pred,
+                "target": ex["target"],
+                "was_correct": ok,
+                "prompt_len": prompt_len,
+                "context_len": context_len,
+                "prompt_text": prompt_text,
+            }
+            if eval_samples > 1:
+                result["source_index"] = idx
+                result["sample_idx"] = sample_idx
+                result["eval_samples"] = eval_samples
+            if metrics:
+                result["metrics"] = metrics
+            results.append(result)
+        return idx, results
 
-    results = [None] * len(examples)
+    per_example_results = [None] * len(examples)
     with ThreadPoolExecutor(max_workers=min(max_workers, len(examples))) as exe:
         futures = {exe.submit(predict_one, i, ex): i for i, ex in enumerate(examples)}
         for future in as_completed(futures):
-            idx, result = future.result()
-            results[idx] = result
+            idx, sample_results = future.result()
+            per_example_results[idx] = sample_results
 
+    results = [
+        result
+        for sample_results in per_example_results
+        for result in (sample_results or [])
+    ]
     correct = sum(1 for r in results if r["was_correct"])
     context_lens = [r["context_len"] for r in results]
     avg_context_len = int(sum(context_lens) / len(context_lens)) if context_lens else 0
     return {
-        "accuracy": correct / len(examples),
+        "accuracy": correct / len(results) if results else 0.0,
         "correct": correct,
-        "total": len(examples),
+        "total": len(results),
         "predictions": results,
         "avg_context_len": avg_context_len,
     }
@@ -546,6 +515,11 @@ if __name__ == "__main__":
         help="Comma-separated literal API keys for round-robin load balancing.",
     )
     parser.add_argument(
+        "--api-keys-env",
+        default=None,
+        help="Environment variable containing comma-separated API keys for round-robin load balancing.",
+    )
+    parser.add_argument(
         "--mode",
         default=cfg["inner_loop"].get("mode", "online"),
         choices=["online", "offline"],
@@ -577,6 +551,18 @@ if __name__ == "__main__":
         type=int,
         default=cfg["inner_loop"].get("max_workers", 32),
         help="Maximum parallel LLM calls inside this run",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=cfg["inner_loop"].get("max_tokens", 16384),
+        help="Maximum completion tokens for each LLM call",
+    )
+    parser.add_argument(
+        "--eval-samples",
+        type=int,
+        default=cfg["inner_loop"].get("eval_samples", 1),
+        help="Number of prediction samples per eval item; each sample is scored separately",
     )
     # New output args: split val/test into separate files
     parser.add_argument(
@@ -684,9 +670,17 @@ if __name__ == "__main__":
             model_cfg = candidate
             break
     api_key_env = args.api_key_env or model_cfg.get("api_key_env")
+    api_keys_env = args.api_keys_env or model_cfg.get("api_keys_env")
     api_keys = []
     if args.api_keys:
         api_keys = [key.strip() for key in args.api_keys.split(",") if key.strip()]
+    elif api_keys_env:
+        raw_keys = os.environ.get(str(api_keys_env), "")
+        api_keys = [key.strip() for key in raw_keys.split(",") if key.strip()]
+        if not api_keys:
+            raise ValueError(
+                f"Configured api_keys_env '{api_keys_env}' is not set or has no keys"
+            )
     elif model_cfg.get("api_keys"):
         api_keys = [str(key) for key in model_cfg.get("api_keys", []) if str(key)]
     api_key = args.api_key or model_cfg.get("api_key")
@@ -710,6 +704,7 @@ if __name__ == "__main__":
         api_keys=api_keys,
         api_base=api_base,
         temperature=args.temperature,
+        max_tokens=args.max_tokens,
         max_workers=args.max_workers,
     )
     memory = load_memory_system(path=args.memory, llm=llm)
@@ -763,7 +758,6 @@ if __name__ == "__main__":
                 step_offset=0,
                 mode="offline",
                 num_epochs=args.num_epochs,
-                val_examples=val_examples if val_examples else None,
                 skip_train_eval=not eval_test,
             )
             train_correct = chunk_results["correct"]
@@ -805,13 +799,20 @@ if __name__ == "__main__":
 
     if eval_val and eval_test:
         combined = evaluate_memory(
-            memory, val_examples + test_examples, evaluator, args.max_workers
+            memory,
+            val_examples + test_examples,
+            evaluator,
+            args.max_workers,
+            args.eval_samples,
         )
         avg_context_len = combined["avg_context_len"]
-        val_preds = combined["predictions"][: len(val_examples)]
-        test_preds = combined["predictions"][len(val_examples) :]
+        val_count = len(val_examples) * max(1, int(args.eval_samples or 1))
+        val_preds = combined["predictions"][:val_count]
+        test_preds = combined["predictions"][val_count:]
     elif eval_val:
-        result = evaluate_memory(memory, val_examples, evaluator, args.max_workers)
+        result = evaluate_memory(
+            memory, val_examples, evaluator, args.max_workers, args.eval_samples
+        )
         avg_context_len = result["avg_context_len"]
         val_preds = result["predictions"]
     elif eval_test:
@@ -863,6 +864,8 @@ if __name__ == "__main__":
             "seed": args.seed,
             "mode": args.mode,
             "num_epochs": args.num_epochs if args.mode == "offline" else None,
+            "eval_samples": args.eval_samples if args.val_output else 1,
+            "eval_sample_mode": "separate",
             "timestamp": datetime.now().isoformat(),
             "runtime_seconds": round(runtime, 2),
             "memory_context_chars": avg_context_len,
